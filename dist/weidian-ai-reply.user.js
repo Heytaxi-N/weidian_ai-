@@ -281,6 +281,9 @@ const __KB_FAQ__    = "# 高频可自动回复话术\n\n以下内容或类似语
 
     // 自动发送开关（true = AI 草稿直接发给买家；false = 只 console 打草稿）
     autoreplyEnabled: lsGet('autoreplyEnabled') === 'true',
+
+    // 测试白名单：非空时只自动回复这些 uid，其他买家仍走草稿模式
+    testOnlyUids: JSON.parse(lsGet('testOnlyUids') || '[]'),
   };
 
   // ===========================================================================
@@ -600,8 +603,14 @@ const __KB_FAQ__    = "# 高频可自动回复话术\n\n以下内容或类似语
 
     // 自动答 ✓
     if (CFG.autoreplyEnabled) {
-      const ok = await sendReply(aiResult.draft);
-      if (!ok) console.error(TAG, '❌ 发送失败（输入框未找到），草稿:', aiResult.draft);
+      const whitelisted = CFG.testOnlyUids.length === 0
+        || CFG.testOnlyUids.includes(ev.buyerUid);
+      if (whitelisted) {
+        const ok = await sendReply(aiResult.draft);
+        if (!ok) console.error(TAG, '❌ 发送失败（输入框未找到），草稿:', aiResult.draft);
+      } else {
+        console.log(TAG, '⏭️ 白名单外，仅草稿:', ev.buyerUid);
+      }
     }
   }
 
@@ -664,6 +673,16 @@ const __KB_FAQ__    = "# 高频可自动回复话术\n\n以下内容或类似语
       console.log(TAG, ok ? '✅ 手动发送成功' : '❌ 手动发送失败');
       return ok;
     },
+    addTestUid: (uid) => {
+      if (!CFG.testOnlyUids.includes(uid)) CFG.testOnlyUids.push(uid);
+      lsSet('testOnlyUids', JSON.stringify(CFG.testOnlyUids));
+      console.log(TAG, '白名单:', CFG.testOnlyUids);
+    },
+    clearTestUids: () => {
+      CFG.testOnlyUids = [];
+      lsSet('testOnlyUids', '[]');
+      console.log(TAG, '白名单已清空（全量模式）');
+    },
     conversations: () => Array.from(conversations.entries()).map(([uid, c]) => ({
       uid, history: c.history, lastProductCard: c.lastProductCard
     })),
@@ -679,10 +698,12 @@ const __KB_FAQ__    = "# 高频可自动回复话术\n\n以下内容或类似语
     },
     help: () => console.log(`
 ${TAG} Phase 4b — 自动发送 + 配置持久化
-  __wd.setKey('sk-xxx')        设置 DeepSeek key（持久化到 localStorage）
+  __wd.setKey('sk-xxx')        设置 DeepSeek key（持久化）
   __wd.setWebhook('https://...key=xxx')  设置企微 webhook（持久化）
   __wd.toggle()                开/关自动发送（持久化）  当前: ${CFG.autoreplyEnabled ? 'ON' : 'OFF'}
-  __wd.send('测试文字')        手动发送到当前会话（验证输入框能否驱动）
+  __wd.addTestUid('uid')       加买家到白名单（持久化）  白名单非空时只回复白名单内的人
+  __wd.clearTestUids()         清空白名单（= 全量模式）
+  __wd.send('测试文字')        手动发送到当前会话
   __wd.testAI('问题','商品','￥价格')  本地测 AI 草稿（不发送）
   __wd.conversations()         查看会话状态
   __wd.config()                查看完整配置
@@ -691,8 +712,9 @@ ${TAG} Phase 4b — 自动发送 + 配置持久化
 
   const status = [
     CFG.autoreplyEnabled ? '🟢 自动发送 ON' : '🔴 自动发送 OFF',
-    CFG.deepseekApiKey.includes('PLACEHOLDER') ? '⚠️ key 未设置' : '✅ key 已配置',
-    CFG.qywxWebhookUrl ? '✅ webhook 已配置' : '⚠️ webhook 未设置',
-  ].join(' | ');
+    CFG.deepseekApiKey.includes('PLACEHOLDER') ? '⚠️ key 未设置' : '✅ key',
+    CFG.qywxWebhookUrl ? '✅ webhook' : '⚠️ webhook 未设置',
+    CFG.testOnlyUids.length > 0 ? `🧪 白名单: ${CFG.testOnlyUids.length} 人` : '',
+  ].filter(Boolean).join(' | ');
   console.log(`${TAG} Phase 4b 已加载. ${status}  调 __wd.help() 看用法`);
 })();
