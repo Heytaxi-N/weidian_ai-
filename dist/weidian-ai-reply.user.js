@@ -533,24 +533,9 @@ const __KB_FAQ__    = "# 高频可自动回复话术\n\n以下内容或类似语
   // ===========================================================================
   // 控制器
   // ===========================================================================
-  async function handleIncoming(parsed) {
-    const ev = classifyIncoming(parsed);
-    if (!ev) return;
+  const buyerLocks = new Map();
 
-    if (ev.kind === 'product_card') {
-      const conv = getConv(ev.buyerUid);
-      conv.lastProductCard = { ...ev, ts: Date.now() };
-      console.log(TAG, '🛍️ 商品卡片', ev.buyerUid, ev.title, ev.price || '');
-      return;
-    }
-    if (ev.kind !== 'text') return;
-
-    const text = safeDecode(ev.text || '');
-    console.log(TAG, '👤', ev.buyerName || ev.buyerUid, '→', text);
-
-    // 总是把进线文字进 history，方便 escalation 卡片拿"最近 N 条"
-    addToHistory(ev.buyerUid, 'user', text);
-
+  async function processText(ev, text) {
     // —— 关键词硬触发：不调 LLM 直接 escalate ——
     const kwHit = keywordCheck(text, CFG.blacklist);
     if (kwHit.hit) {
@@ -578,7 +563,6 @@ const __KB_FAQ__    = "# 高频可自动回复话术\n\n以下内容或类似语
       );
     } catch (e) {
       console.error(TAG, '❌ DeepSeek 失败：', e.message);
-      // LLM 失败：也 escalate，让人工兜
       await pushEscalation({
         buyerUid: ev.buyerUid, buyerName: ev.buyerName,
         draft: CFG.fallbackText,
@@ -612,6 +596,28 @@ const __KB_FAQ__    = "# 高频可自动回复话术\n\n以下内容或类似语
         console.log(TAG, '⏭️ 白名单外，仅草稿:', ev.buyerUid);
       }
     }
+  }
+
+  async function handleIncoming(parsed) {
+    const ev = classifyIncoming(parsed);
+    if (!ev) return;
+
+    if (ev.kind === 'product_card') {
+      const conv = getConv(ev.buyerUid);
+      conv.lastProductCard = { ...ev, ts: Date.now() };
+      console.log(TAG, '🛍️ 商品卡片', ev.buyerUid, ev.title, ev.price || '');
+      return;
+    }
+    if (ev.kind !== 'text') return;
+
+    const text = safeDecode(ev.text || '');
+    console.log(TAG, '👤', ev.buyerName || ev.buyerUid, '→', text);
+    addToHistory(ev.buyerUid, 'user', text);
+
+    // per-buyer 串行锁：上一条还在处理时排队，避免并发调 API
+    const prev = buyerLocks.get(ev.buyerUid) || Promise.resolve();
+    const current = prev.then(() => processText(ev, text)).catch(e => console.error(TAG, e));
+    buyerLocks.set(ev.buyerUid, current);
   }
 
   // ===========================================================================
