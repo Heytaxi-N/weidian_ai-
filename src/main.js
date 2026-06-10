@@ -191,7 +191,7 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
     deepseekModel:   'deepseek-v4-flash',
     deepseekUrl:     'https://api.deepseek.com/chat/completions',
     deepseekTemperature: 0.5,
-    deepseekMaxTokens: 400,
+    deepseekMaxTokens: 800,
 
     // 店铺
     sellerUid:  '7761657479685210349',
@@ -282,7 +282,13 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
   function classifyIncoming(parsed) {
     if (parsed.kind !== 'json' || parsed.data?.subCmd !== 'send_notify') return null;
     let pc; try { pc = JSON.parse(parsed.data.protocolContent); } catch { return null; }
-    if (pc.fromSourceType !== 5008) return null;   // 5008 = 买家发出；过滤掉卖家自己的回显
+    if (pc.fromSourceType !== 5008) {
+      // 非买家进线（系统提示、卖家回显、其他来源）；只在 debug 时打印
+      if (pageWindow.__wd_debug) {
+        console.log(TAG, '🔍 skip non-buyer:', pc.fromSourceType, 'mediaType:', pc.msgMediaType, 'fromUid:', pc.fromUid);
+      }
+      return null;
+    }
     const buyerUid = pc.fromUid;
 
     if (pc.msgMediaType === 8) {
@@ -388,12 +394,14 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
     }
     const json = await res.json();
     const raw = (json.choices?.[0]?.message?.content || '').trim();
+    const finishReason = json.choices?.[0]?.finish_reason;
     const parsed = parseAIOutput(raw);
     if (!parsed.ok) {
-      // 安全默认：JSON 失败视为 escalate
+      // 安全默认：JSON 失败视为 escalate；附 finish_reason 帮助定位（length=被 max_tokens 截断）
+      console.error(TAG, '❌ JSON 解析失败 finish=', finishReason, '原文:', raw);
       return {
         should_escalate: true,
-        reason: 'JSON 解析失败: ' + parsed.error + ' | 原文: ' + raw.slice(0, 200),
+        reason: `JSON 解析失败 (finish=${finishReason}): ${parsed.error} | 原文: ${raw.slice(0, 200)}`,
         draft: CFG.fallbackText,
       };
     }
@@ -499,28 +507,109 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
     return null;
   }
 
-  async function sendReply(text) {
-    const editor = findEditor();
-    if (!editor) {
-      console.error(TAG, '❌ 找不到输入框 (.textInput .editor)');
-      return false;
+  function getCurrentHashUid() {
+    const m = location.hash.match(/#\/session\/recent\/(\d+)/);
+    return m ? m[1] : null;
+  }
+
+  // 全局发送串行锁：编辑器是单例 DOM 资源，必须保证同时只有一个 send 流程在动 hash 和编辑器
+  let sendLock = Promise.resolve();
+  function withSendLock(fn) {
+    const next = sendLock.then(fn, fn);
+    sendLock = next.catch(() => {});
+    return next;
+  }
+
+  /**
+   * 验证：Enter 后是否真的有一条 send 帧出去到目标 uid。
+   * 微店页面切会话后，编辑器 DOM 存在但 React 内部 state 可能还指向旧会话，
+   * execCommand+Enter 会静默失败（前端无报错，但 WS 没发出 send 帧）。
+   * 必须通过 WS 出口帧确认。
+   */
+  async function verifyOutgoingSend(targetUid, beforeSnapshot, timeoutMs = 2000) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeoutMs) {
+      const out = pageWindow.__wd_lastOutgoing;
+      if (out && out !== beforeSnapshot && out.kind === 'json') {
+        const d = out.data;
+        if (d?.cmd === 'msg' && d?.sub === 'send' && String(d?.body?.toUid) === String(targetUid)) {
+          return d;
+        }
+      }
+      await new Promise(r => setTimeout(r, 100));
     }
-    editor.focus();
-    // 清空已有内容
-    document.execCommand('selectAll', false);
-    document.execCommand('delete', false);
-    // 写入 AI 回复
-    document.execCommand('insertText', false, text);
-    // 等一帧让框架同步状态
-    await new Promise(r => setTimeout(r, 50));
-    // 按 Enter 发送
-    for (const evType of ['keydown', 'keypress', 'keyup']) {
-      editor.dispatchEvent(new KeyboardEvent(evType, {
-        key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
-      }));
-    }
-    console.log(TAG, '📤 已发送:', text.slice(0, 60));
-    return true;
+    return null;
+  }
+
+  /**
+   * 发送回复给指定买家。
+   * targetUid 必填（防止串发）：会先把 hash 切到目标会话、等编辑器对齐再写入。
+   * 编辑器里有非空草稿时直接放弃发送（避免覆盖人工输入），调用方应走 escalation。
+   * 发送后通过 WS 出口帧验证；未观察到 send 帧 → 返 false（让调用方推草稿）。
+   */
+  async function sendReply(text, targetUid) {
+    return withSendLock(async () => {
+      // 1. hash 对齐：不匹配则切换（waitFor 在 Phase 4d 区块声明，函数提升后可用）
+      if (targetUid) {
+        const currentUid = getCurrentHashUid();
+        if (currentUid !== targetUid) {
+          console.log(TAG, '🔀 切换会话:', currentUid || '(none)', '→', targetUid);
+          location.hash = '#/session/recent/' + targetUid;
+          const hashOk = await waitFor(() => getCurrentHashUid() === targetUid, 3000, 100);
+          if (!hashOk) {
+            console.error(TAG, '❌ hash 切换超时，目标:', targetUid);
+            return false;
+          }
+          const editorReady = await waitFor(findEditor, 3000, 100);
+          if (!editorReady) {
+            console.error(TAG, '❌ 切换后编辑器未出现:', targetUid);
+            return false;
+          }
+          // React state / WS 订阅切到新会话需要 ~1.5s；之前 200ms 太短导致 Enter 静默失败
+          await new Promise(r => setTimeout(r, 1500));
+        }
+      }
+
+      // 2. 拿编辑器
+      const editor = findEditor();
+      if (!editor) {
+        console.error(TAG, '❌ 找不到输入框 (.textInput .editor)');
+        return false;
+      }
+
+      // 3. 内容守卫：有任何内容都不覆盖（可能是卖家正在打字）
+      if (editor.textContent.trim().length > 0) {
+        console.warn(TAG, '⚠️ 编辑器有内容，放弃发送（避免覆盖人工输入）:', targetUid || '(unknown)');
+        return false;
+      }
+
+      // 4. 写入 + Enter，并捕获 Enter 前的最后一帧 outgoing 作为基线
+      const beforeOut = pageWindow.__wd_lastOutgoing;
+      editor.focus();
+      document.execCommand('selectAll', false);
+      document.execCommand('delete', false);
+      document.execCommand('insertText', false, text);
+      await new Promise(r => setTimeout(r, 50));
+      for (const evType of ['keydown', 'keypress', 'keyup']) {
+        editor.dispatchEvent(new KeyboardEvent(evType, {
+          key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
+        }));
+      }
+
+      // 5. 验证 WS 出口帧 —— 这是判断是否真的发出去的唯一可靠信号
+      const verifyTarget = targetUid || getCurrentHashUid();
+      if (!verifyTarget) {
+        console.warn(TAG, '⚠️ 无 targetUid 且 hash 无 uid，跳过验证');
+        return true;
+      }
+      const sentFrame = await verifyOutgoingSend(verifyTarget, beforeOut, 2000);
+      if (!sentFrame) {
+        console.error(TAG, '❌ Enter 后未观察到 send 帧（页面 state 未对齐？）→', verifyTarget, ':', text.slice(0, 60));
+        return false;
+      }
+      console.log(TAG, '📤 已发送（已验证 WS 帧）→', verifyTarget, ':', text.slice(0, 60));
+      return true;
+    });
   }
 
   // ===========================================================================
@@ -582,11 +671,17 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
       const whitelisted = CFG.testOnlyUids.length === 0
         || CFG.testOnlyUids.includes(ev.buyerUid);
       if (whitelisted) {
-        const ok = await sendReply(aiResult.draft);
+        const ok = await sendReply(aiResult.draft, ev.buyerUid);
         if (ok) {
           addToHistory(ev.buyerUid, 'assistant', aiResult.draft);
         } else {
-          console.error(TAG, '❌ 发送失败（输入框未找到），草稿:', aiResult.draft);
+          console.error(TAG, '❌ 发送失败 → 推草稿到企微:', aiResult.draft);
+          await pushEscalation({
+            buyerUid: ev.buyerUid, buyerName: ev.buyerName,
+            draft: aiResult.draft,
+            reason: 'sendReply 失败（会话切换超时 / 编辑器有内容 / 找不到编辑器）',
+            currentText: text,
+          });
         }
       } else {
         addToHistory(ev.buyerUid, 'assistant', aiResult.draft);
@@ -607,10 +702,16 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
       console.log(TAG, '🛍️ 商品卡片', ev.buyerUid, ev.title, ev.price || '');
       return;
     }
-    if (ev.kind !== 'text') return;
+    if (ev.kind !== 'text') {
+      console.log(TAG, '⏭️ 非文本消息，不处理:', ev.buyerUid, 'kind=', ev.kind, 'mediaType=', ev.msgMediaType);
+      return;
+    }
 
     // 忽略名单（供货商等）
-    if (CFG.ignoreUids.includes(ev.buyerUid)) return;
+    if (CFG.ignoreUids.includes(ev.buyerUid)) {
+      console.log(TAG, '⏭️ 忽略名单:', ev.buyerUid);
+      return;
+    }
 
     const text = safeDecode(ev.text || '');
 
@@ -981,10 +1082,14 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
       console.log(TAG, `autoreply ${CFG.autoreplyEnabled ? '✅ 已开启' : '⏸️ 已关闭'}（已持久化）`);
       return CFG.autoreplyEnabled;
     },
-    send: async (text) => {
-      const ok = await sendReply(text);
+    send: async (text, targetUid) => {
+      const ok = await sendReply(text, targetUid);
       console.log(TAG, ok ? '✅ 手动发送成功' : '❌ 手动发送失败');
       return ok;
+    },
+    debug: (on = true) => {
+      pageWindow.__wd_debug = on;
+      console.log(TAG, on ? '🔍 debug 模式开（打印所有 WS 进线 + 跳过原因）' : '🔍 debug 模式关');
     },
     addTestUid: (uid) => {
       if (!CFG.testOnlyUids.includes(uid)) CFG.testOnlyUids.push(uid);
