@@ -222,6 +222,11 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
 
     // 测试白名单：非空时只自动回复这些 uid，其他买家仍走草稿模式
     testOnlyUids: JSON.parse(lsGet('testOnlyUids') || '[]'),
+
+    // 未读扫描
+    sweepOnLoad: lsGet('sweepOnLoad') !== 'false',   // 页面加载后自动扫描未读
+    sweepDelayMs:    1500,  // hash 变化后等多久再拉历史
+    sweepIntervalMs: 3000,  // 扫描时两个会话之间的间隔
   };
 
   // ===========================================================================
@@ -233,6 +238,20 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
     catch { return { kind: 'text', text: raw }; }
   }
   function safeDecode(s) { try { return decodeURIComponent(s); } catch { return s; } }
+
+  // ===========================================================================
+  // 消息去重：WS 实时路径和扫描路径共用，防止重复处理
+  // ===========================================================================
+  const processedMsgIds = new Set();
+  const PROCESSED_MAX = 500;
+  function markProcessed(msgId) {
+    if (!msgId) return;
+    processedMsgIds.add(msgId);
+    if (processedMsgIds.size > PROCESSED_MAX) {
+      const first = processedMsgIds.values().next().value;
+      processedMsgIds.delete(first);
+    }
+  }
 
   // ===========================================================================
   // 对话状态：每个买家独立的历史 + 最后看过的商品卡片
@@ -272,7 +291,7 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
     if (pc.msgMediaType === 1) {
       let buyerName = null;
       try { buyerName = JSON.parse(pc.userData || '{}')?.fromUserInfo?.name; } catch {}
-      return { kind: 'text', buyerUid, buyerName, text: pc.msgData };
+      return { kind: 'text', buyerUid, buyerName, text: pc.msgData, msgId: pc.servMsgid || null };
     }
     return { kind: 'unsupported_media', buyerUid, msgMediaType: pc.msgMediaType };
   }
@@ -332,18 +351,29 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
     if (!CFG.deepseekApiKey || CFG.deepseekApiKey.includes('PLACEHOLDER')) {
       throw new Error('DeepSeek API key 还没填，改 CFG.deepseekApiKey 或调 __wd.setKey(...)');
     }
-    const res = await fetch(CFG.deepseekUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${CFG.deepseekApiKey}` },
-      body: JSON.stringify({
-        model: CFG.deepseekModel,
-        messages,
-        temperature: CFG.deepseekTemperature,
-        max_tokens: CFG.deepseekMaxTokens,
-        stream: false,
-        response_format: { type: 'json_object' },
-      }),
-    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30000);
+    let res;
+    try {
+      res = await fetch(CFG.deepseekUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${CFG.deepseekApiKey}` },
+        body: JSON.stringify({
+          model: CFG.deepseekModel,
+          messages,
+          temperature: CFG.deepseekTemperature,
+          max_tokens: CFG.deepseekMaxTokens,
+          stream: false,
+          response_format: { type: 'json_object' },
+        }),
+        signal: controller.signal,
+      });
+    } catch (e) {
+      if (e.name === 'AbortError') throw new Error('DeepSeek 请求超时 (30s)');
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
     if (!res.ok) {
       const body = await res.text().catch(() => '');
       throw new Error(`DeepSeek HTTP ${res.status}: ${body.slice(0, 200)}`);
@@ -430,6 +460,23 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
   }
 
   // ===========================================================================
+  // HTTP API 辅助（thor.weidian.com，复用页面 cookie）
+  // ===========================================================================
+  async function thorGet(path, params) {
+    const url = `https://thor.weidian.com${path}?param=${encodeURIComponent(JSON.stringify(params))}`;
+    const res = await fetch(url, { credentials: 'include' });
+    if (!res.ok) throw new Error(`thor ${path} → ${res.status}`);
+    return res.json();
+  }
+
+  async function fetchRecentMessages(targetUid, limit = 5) {
+    return thorGet('/immessage/history.getMessage/1.0', {
+      targetUid, startMsgId: '9223372036854775807', limit, direction: 0,
+      fromSourceType: 1001, isLimitTag: true, searchType: 1,
+    });
+  }
+
+  // ===========================================================================
   // UI 驱动发送（Phase 4b）
   // ===========================================================================
   function findEditor() {
@@ -510,9 +557,8 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
       return;
     }
 
-    addToHistory(ev.buyerUid, 'assistant', aiResult.draft);
-
     if (aiResult.should_escalate) {
+      addToHistory(ev.buyerUid, 'assistant', aiResult.draft);
       console.warn(TAG, '🚧 LLM 自评 escalate:', aiResult.reason);
       await pushEscalation({
         buyerUid: ev.buyerUid, buyerName: ev.buyerName,
@@ -529,10 +575,17 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
         || CFG.testOnlyUids.includes(ev.buyerUid);
       if (whitelisted) {
         const ok = await sendReply(aiResult.draft);
-        if (!ok) console.error(TAG, '❌ 发送失败（输入框未找到），草稿:', aiResult.draft);
+        if (ok) {
+          addToHistory(ev.buyerUid, 'assistant', aiResult.draft);
+        } else {
+          console.error(TAG, '❌ 发送失败（输入框未找到），草稿:', aiResult.draft);
+        }
       } else {
+        addToHistory(ev.buyerUid, 'assistant', aiResult.draft);
         console.log(TAG, '⏭️ 白名单外，仅草稿:', ev.buyerUid);
       }
+    } else {
+      addToHistory(ev.buyerUid, 'assistant', aiResult.draft);
     }
   }
 
@@ -549,6 +602,14 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
     if (ev.kind !== 'text') return;
 
     const text = safeDecode(ev.text || '');
+
+    // 去重：同一条消息不处理两次（WS + 扫描路径可能重叠）
+    if (ev.msgId && processedMsgIds.has(ev.msgId)) {
+      console.log(TAG, '⏭️ 已处理过:', ev.msgId);
+      return;
+    }
+    if (ev.msgId) markProcessed(ev.msgId);
+
     console.log(TAG, '👤', ev.buyerName || ev.buyerUid, '→', text);
     addToHistory(ev.buyerUid, 'user', text);
 
@@ -556,6 +617,301 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
     const prev = buyerLocks.get(ev.buyerUid) || Promise.resolve();
     const current = prev.then(() => processText(ev, text)).catch(e => console.error(TAG, e));
     buyerLocks.set(ev.buyerUid, current);
+  }
+
+  // ===========================================================================
+  // 会话切换监听 + 未读扫描（Phase 4d）
+  // ===========================================================================
+
+  // 轮询等待某个条件成立，最长 maxMs 毫秒
+  function waitFor(fn, maxMs = 3000, interval = 200) {
+    return new Promise(resolve => {
+      const t0 = Date.now();
+      const check = () => {
+        const r = fn();
+        if (r) return resolve(r);
+        if (Date.now() - t0 > maxMs) return resolve(null);
+        setTimeout(check, interval);
+      };
+      check();
+    });
+  }
+
+  let sweepInProgress = false;    // 防止多次并发 sweep
+  let switchHandlerBusy = false;  // 当前是否正在处理一个会话切换
+  let switchBusySince = 0;        // busy 开始时间，用于超时保护
+
+  /**
+   * 会话切换处理：拉历史 → 找最新买家消息 → 走 AI 流程
+   * 由 hashchange 或 sweep 点击触发
+   */
+  async function onConversationSwitch(buyerUid) {
+    if (switchHandlerBusy) {
+      if (Date.now() - switchBusySince > 60000) {
+        console.warn(TAG, '⚠️ switchHandler 超时 60s，强制重置');
+        switchHandlerBusy = false;
+      } else {
+        return;
+      }
+    }
+    if (buyerUid === CFG.sellerUid) return;
+    switchHandlerBusy = true;
+    switchBusySince = Date.now();
+    try {
+      console.log(TAG, '🔄 会话切换:', buyerUid);
+
+      // 等页面加载会话（编辑器出现 = 会话已渲染）
+      await new Promise(r => setTimeout(r, CFG.sweepDelayMs));
+      const editor = await waitFor(findEditor, 3000);
+      if (!editor) {
+        console.warn(TAG, '⚠️ 编辑器未出现，跳过:', buyerUid);
+        return;
+      }
+
+      // 检查编辑器是否有卖家正在输入的内容
+      if (editor.textContent.trim().length > 0) {
+        console.log(TAG, '⏭️ 编辑器有内容，跳过（避免覆盖）:', buyerUid);
+        return;
+      }
+
+      // 拉历史消息
+      let histResp;
+      try {
+        histResp = await fetchRecentMessages(buyerUid, 10);
+      } catch (e) {
+        console.error(TAG, '❌ 拉历史失败:', e.message);
+        return;
+      }
+      const msgs = histResp?.result?.msgs;
+      if (!msgs || msgs.length === 0) {
+        console.log(TAG, '⏭️ 无历史消息:', buyerUid);
+        return;
+      }
+
+      // 最后一条不是买家发的 → 无需再回（已回复 / 系统消息 / 其他客服）
+      const lastMsg = msgs[msgs.length - 1];
+      if (lastMsg.fromUid !== buyerUid) {
+        console.log(TAG, '⏭️ 最后一条非买家消息，跳过:', buyerUid);
+        return;
+      }
+
+      // 从最新往旧找第一条买家文本消息（精确匹配 buyerUid，排除系统消息）
+      let lastBuyerMsg = null;
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i];
+        if (m.fromUid === buyerUid && m.msgMediaType === 1) {
+          lastBuyerMsg = m;
+          break;
+        }
+      }
+      if (!lastBuyerMsg) {
+        console.log(TAG, '⏭️ 无买家文本消息:', buyerUid);
+        return;
+      }
+
+      // 去重
+      const msgId = lastBuyerMsg.servMsgid;
+      if (msgId && processedMsgIds.has(msgId)) {
+        console.log(TAG, '⏭️ 已处理过:', msgId);
+        return;
+      }
+      if (msgId) markProcessed(msgId);
+
+      // 用历史预填 conversations Map（让 AI 有多轮上下文）
+      // 只收买家消息和卖家回复，排除系统消息和其他客服
+      const conv = getConv(buyerUid);
+      if (conv.history.length === 0) {
+        for (const m of msgs) {
+          if (m.msgMediaType !== 1) continue;
+          let role;
+          if (m.fromUid === buyerUid) role = 'user';
+          else if (m.fromUid === CFG.sellerUid) role = 'assistant';
+          else continue;  // 系统消息、其他客服 → 不进历史
+          const text = safeDecode(m.msgData || '');
+          conv.history.push({ role, text, ts: parseInt(m.time) || Date.now() });
+        }
+        while (conv.history.length > CFG.historyLimit) conv.history.shift();
+        // 移除最后一条（即将作为 currentText 传入 processText）
+        if (conv.history.length > 0 && conv.history[conv.history.length - 1].role === 'user') {
+          conv.history.pop();
+        }
+      }
+
+      // 提取商品卡片上下文
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i].msgMediaType === 8) {
+          try {
+            const detail = JSON.parse(msgs[i].detail || '{}');
+            conv.lastProductCard = {
+              title: detail.text || msgs[i].msgData,
+              price: detail.data?.subTitle,
+              itemId: detail.message_source?.id,
+              ts: parseInt(msgs[i].time) || Date.now(),
+            };
+          } catch {}
+          break;
+        }
+      }
+
+      const text = safeDecode(lastBuyerMsg.msgData || '');
+      let buyerName = null;
+      try { buyerName = JSON.parse(lastBuyerMsg.userData || '{}')?.fromUserInfo?.name; } catch {}
+
+      console.log(TAG, '📬 未读处理:', buyerName || buyerUid, '→', text);
+      addToHistory(buyerUid, 'user', text);
+
+      const ev = { buyerUid, buyerName };
+      const prev = buyerLocks.get(buyerUid) || Promise.resolve();
+      const current = prev.then(() => processText(ev, text)).catch(e => console.error(TAG, e));
+      buyerLocks.set(buyerUid, current);
+      await current;
+
+    } finally {
+      switchHandlerBusy = false;
+    }
+  }
+
+  // hashchange 监听
+  function setupHashChangeListener() {
+    pageWindow.addEventListener('hashchange', () => {
+      const match = location.hash.match(/#\/session\/recent\/(\d+)/);
+      if (!match) return;
+      const uid = match[1];
+      onConversationSwitch(uid).catch(e => console.error(TAG, '会话切换处理失败:', e));
+    });
+    console.log(TAG, '🔗 hashchange 监听已注册');
+  }
+
+  /**
+   * 发现侧边栏中有未读角标的会话项
+   * 返回 DOM 元素数组（点击后触发 hash 导航）
+   */
+  function discoverUnreadItems() {
+    const badges = document.querySelectorAll('.session-item-box .unread-hot-tag');
+    const items = [];
+    for (const badge of badges) {
+      const count = parseInt(badge.textContent);
+      if (!(count > 0)) continue;
+      const box = badge.closest('.session-item-box');
+      if (box) items.push(box);
+    }
+    return items;
+  }
+
+  /**
+   * 扫描所有未读会话并依次处理
+   */
+  async function sweep() {
+    if (!CFG.autoreplyEnabled) {
+      console.log(TAG, '⏸️ sweep 跳过：autoreply 未开启');
+      return { total: 0, processed: 0, skipped: 0 };
+    }
+    if (sweepInProgress) {
+      console.log(TAG, '⏳ sweep 已在进行中');
+      return null;
+    }
+    sweepInProgress = true;
+    const stats = { total: 0, processed: 0, skipped: 0, errors: 0 };
+    try {
+      const items = discoverUnreadItems();
+      stats.total = items.length;
+      console.log(TAG, `🧹 sweep 开始：发现 ${items.length} 个未读会话`);
+
+      for (const item of items) {
+        try {
+          // 点击会话项，触发 hash 导航
+          item.click();
+          // 等待 hash 变化
+          await new Promise(r => setTimeout(r, 500));
+
+          const match = location.hash.match(/#\/session\/recent\/(\d+)/);
+          if (!match) {
+            console.warn(TAG, '⚠️ 点击后 hash 未变化');
+            stats.skipped++;
+            continue;
+          }
+          const uid = match[1];
+
+          // 白名单检查
+          if (CFG.testOnlyUids.length > 0 && !CFG.testOnlyUids.includes(uid)) {
+            console.log(TAG, '⏭️ sweep 白名单外:', uid);
+            stats.skipped++;
+            await new Promise(r => setTimeout(r, 500));
+            continue;
+          }
+
+          await onConversationSwitch(uid);
+          stats.processed++;
+        } catch (e) {
+          console.error(TAG, '❌ sweep 单项失败:', e.message);
+          stats.errors++;
+        }
+        // 人性化间隔
+        await new Promise(r => setTimeout(r, CFG.sweepIntervalMs));
+      }
+
+      console.log(TAG, `🧹 sweep 完成：${stats.total} 个未读，处理 ${stats.processed}，跳过 ${stats.skipped}，失败 ${stats.errors}`);
+      return stats;
+    } finally {
+      sweepInProgress = false;
+    }
+  }
+
+  /**
+   * 清理过期的 Map 条目（30 分钟无活动）
+   */
+  function cleanupMaps() {
+    const cutoff = Date.now() - 30 * 60 * 1000;
+    let cleaned = 0;
+    for (const [uid, conv] of conversations) {
+      const lastTs = conv.history.length ? conv.history[conv.history.length - 1].ts : 0;
+      if (lastTs < cutoff) {
+        conversations.delete(uid);
+        buyerLocks.delete(uid);
+        cleaned++;
+      }
+    }
+    if (cleaned > 0) console.log(TAG, `🧹 清理 ${cleaned} 个过期会话`);
+  }
+
+  /**
+   * 页面加载后启动周期性扫描（首次 + 每 5 分钟）
+   */
+  let lastWsMessageAt = Date.now();
+
+  async function startPeriodicSweep() {
+    if (!CFG.sweepOnLoad) return;
+    console.log(TAG, '⏳ 等待侧边栏加载...');
+    const sidebar = await waitFor(
+      () => document.querySelector('.sessions-list-box'),
+      15000, 500
+    );
+    if (!sidebar) {
+      console.warn(TAG, '⚠️ 侧边栏未加载，放弃自动扫描');
+      return;
+    }
+    await new Promise(r => setTimeout(r, 3000));
+
+    // 首次扫描
+    if (CFG.autoreplyEnabled) {
+      console.log(TAG, '🚀 启动首次自动扫描未读...');
+      await sweep().catch(e => console.error(TAG, '首次扫描失败:', e));
+    }
+
+    // 之后每 5 分钟
+    setInterval(() => {
+      // WS 心跳检测
+      if (Date.now() - lastWsMessageAt > 5 * 60 * 1000) {
+        console.warn(TAG, '⚠️ 超过 5 分钟未收到 WS 消息，可能断连');
+      }
+      // 清理过期 Map
+      cleanupMaps();
+      // 周期性扫描
+      if (CFG.autoreplyEnabled && CFG.sweepOnLoad && !sweepInProgress) {
+        console.log(TAG, '🔄 周期性扫描...');
+        sweep().catch(e => console.error(TAG, '周期扫描失败:', e));
+      }
+    }, 5 * 60 * 1000);
   }
 
   // ===========================================================================
@@ -571,6 +927,7 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
     console.log(`${TAG} WS[${id}] OPEN`, url.split('?')[0]);
 
     ws.addEventListener('message', (ev) => {
+      lastWsMessageAt = Date.now();
       const parsed = tryParse(ev.data);
       pageWindow.__wd_lastIncoming = parsed;
       // fire-and-forget；handleIncoming 内部已 try/catch
@@ -640,25 +997,53 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
       console.log(TAG, '测试结果:', result);
       return result;
     },
+    testHistory: async (uid) => {
+      const r = await fetchRecentMessages(uid || CFG.sellerUid);
+      console.log(TAG, '📜 history API 响应:', JSON.stringify(r, null, 2));
+      return r;
+    },
+    sweep: () => sweep(),
+    sweepToggle: () => {
+      CFG.sweepOnLoad = !CFG.sweepOnLoad;
+      lsSet('sweepOnLoad', String(CFG.sweepOnLoad));
+      console.log(TAG, `sweepOnLoad ${CFG.sweepOnLoad ? '✅ 已开启' : '⏸️ 已关闭'}（已持久化）`);
+      return CFG.sweepOnLoad;
+    },
     help: () => console.log(`
-${TAG} Phase 4b — 自动发送 + 配置持久化
+${TAG} Phase 4d — 自动发送 + 未读扫描
   __wd.setKey('sk-xxx')        设置 DeepSeek key（持久化）
   __wd.setWebhook('https://...key=xxx')  设置企微 webhook（持久化）
   __wd.toggle()                开/关自动发送（持久化）  当前: ${CFG.autoreplyEnabled ? 'ON' : 'OFF'}
   __wd.addTestUid('uid')       加买家到白名单（持久化）  白名单非空时只回复白名单内的人
   __wd.clearTestUids()         清空白名单（= 全量模式）
+  __wd.sweep()                 手动扫描未读会话
+  __wd.sweepToggle()           开/关页面加载自动扫描  当前: ${CFG.sweepOnLoad ? 'ON' : 'OFF'}
   __wd.send('测试文字')        手动发送到当前会话
   __wd.testAI('问题','商品','￥价格')  本地测 AI 草稿（不发送）
+  __wd.testHistory('uid')      探测 history API 响应格式
   __wd.conversations()         查看会话状态
   __wd.config()                查看完整配置
     `.trim()),
   };
+
+  // 启动：注册 hashchange 监听 + 自动扫描
+  setupHashChangeListener();
 
   const status = [
     CFG.autoreplyEnabled ? '🟢 自动发送 ON' : '🔴 自动发送 OFF',
     CFG.deepseekApiKey.includes('PLACEHOLDER') ? '⚠️ key 未设置' : '✅ key',
     CFG.qywxWebhookUrl ? '✅ webhook' : '⚠️ webhook 未设置',
     CFG.testOnlyUids.length > 0 ? `🧪 白名单: ${CFG.testOnlyUids.length} 人` : '',
+    CFG.sweepOnLoad ? '🧹 自动扫描 ON' : '',
   ].filter(Boolean).join(' | ');
-  console.log(`${TAG} Phase 4b 已加载. ${status}  调 __wd.help() 看用法`);
+  console.log(`${TAG} Phase 4d 已加载. ${status}  调 __wd.help() 看用法`);
+
+  // 页面加载后启动周期性扫描（首次 + 每 5 分钟）
+  if (document.readyState === 'complete') {
+    startPeriodicSweep().catch(e => console.error(TAG, '周期扫描启动失败:', e));
+  } else {
+    window.addEventListener('load', () => {
+      startPeriodicSweep().catch(e => console.error(TAG, '周期扫描启动失败:', e));
+    });
+  }
 })();
