@@ -223,6 +223,14 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
     // 测试白名单：非空时只自动回复这些 uid，其他买家仍走草稿模式
     testOnlyUids: JSON.parse(lsGet('testOnlyUids') || '[]'),
 
+    // 忽略名单：供货商等不需要自动回复的 uid
+    ignoreUids: JSON.parse(lsGet('ignoreUids') || JSON.stringify([
+      '7825662987032461371',  // 王麻子
+      '8179235360781593369',  // wxy
+      '7787185689990988027',  // 草帽出品【八点开拍】🎩
+      '8263229450404666038',  // 西瓜汁
+    ])),
+
     // 未读扫描
     sweepOnLoad: lsGet('sweepOnLoad') !== 'false',   // 页面加载后自动扫描未读
     sweepDelayMs:    1500,  // hash 变化后等多久再拉历史
@@ -601,6 +609,9 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
     }
     if (ev.kind !== 'text') return;
 
+    // 忽略名单（供货商等）
+    if (CFG.ignoreUids.includes(ev.buyerUid)) return;
+
     const text = safeDecode(ev.text || '');
 
     // 去重：同一条消息不处理两次（WS + 扫描路径可能重叠）
@@ -655,6 +666,7 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
       }
     }
     if (buyerUid === CFG.sellerUid) return;
+    if (CFG.ignoreUids.includes(buyerUid)) return;
     switchHandlerBusy = true;
     switchBusySince = Date.now();
     try {
@@ -984,6 +996,16 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
       lsSet('testOnlyUids', '[]');
       console.log(TAG, '白名单已清空（全量模式）');
     },
+    addIgnoreUid: (uid, name) => {
+      if (!CFG.ignoreUids.includes(uid)) CFG.ignoreUids.push(uid);
+      lsSet('ignoreUids', JSON.stringify(CFG.ignoreUids));
+      console.log(TAG, `忽略名单${name ? '('+name+')' : ''}:`, CFG.ignoreUids);
+    },
+    clearIgnoreUids: () => {
+      CFG.ignoreUids = [];
+      lsSet('ignoreUids', '[]');
+      console.log(TAG, '忽略名单已清空');
+    },
     conversations: () => Array.from(conversations.entries()).map(([uid, c]) => ({
       uid, history: c.history, lastProductCard: c.lastProductCard
     })),
@@ -1016,6 +1038,8 @@ ${TAG} Phase 4d — 自动发送 + 未读扫描
   __wd.toggle()                开/关自动发送（持久化）  当前: ${CFG.autoreplyEnabled ? 'ON' : 'OFF'}
   __wd.addTestUid('uid')       加买家到白名单（持久化）  白名单非空时只回复白名单内的人
   __wd.clearTestUids()         清空白名单（= 全量模式）
+  __wd.addIgnoreUid('uid')     加到忽略名单（持久化）  供货商等永不自动回复
+  __wd.clearIgnoreUids()       清空忽略名单
   __wd.sweep()                 手动扫描未读会话
   __wd.sweepToggle()           开/关页面加载自动扫描  当前: ${CFG.sweepOnLoad ? 'ON' : 'OFF'}
   __wd.send('测试文字')        手动发送到当前会话
@@ -1035,6 +1059,7 @@ ${TAG} Phase 4d — 自动发送 + 未读扫描
     CFG.qywxWebhookUrl ? '✅ webhook' : '⚠️ webhook 未设置',
     CFG.testOnlyUids.length > 0 ? `🧪 白名单: ${CFG.testOnlyUids.length} 人` : '',
     CFG.sweepOnLoad ? '🧹 自动扫描 ON' : '',
+    CFG.ignoreUids.length > 0 ? `🚫 忽略: ${CFG.ignoreUids.length} 人` : '',
   ].filter(Boolean).join(' | ');
   console.log(`${TAG} Phase 4d 已加载. ${status}  调 __wd.help() 看用法`);
 
