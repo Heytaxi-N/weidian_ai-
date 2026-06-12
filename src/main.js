@@ -239,6 +239,8 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
     sweepIntervalMs: 3000,  // 扫描时两个会话之间的间隔
     periodicSweepMs: 120_000,  // 周期性扫描间隔（2 分钟，降低漏消息延迟）
     wsStaleMs:       90_000,   // WS 超过这么久无消息视为可能断连 → 触发补扫
+    contactListPageSize: 25,   // contact.getPcList 每页条数（与页面一致）
+    contactListMaxPages: 5,    // 最多翻几页找未读（未读会冒到最近，125 条足够）
 
     // 发送重试（瞬时类失败：切会话超时 / 编辑器未出现 / 未观察到 WS 帧）
     sendMaxAttempts: 2,     // 含首次
@@ -529,6 +531,46 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
       targetUid, startMsgId: '9223372036854775807', limit, direction: 0,
       fromSourceType: 1001, isLimitTag: true, searchType: 1,
     });
+  }
+
+  // 全店未读消息总数（便宜的「有没有未读」探针，0 → sweep 直接早退出）。
+  // 响应：result.unreadCount（字符串）。返回 number；拿不到返回 -1（按"不确定"处理）。
+  async function fetchUnreadCount() {
+    try {
+      const resp = await thorGet('/immessage/unread.getCount/1.0', { sourceType: 1001 });
+      const n = parseInt(resp?.result?.unreadCount, 10);
+      return Number.isFinite(n) ? n : -1;
+    } catch (e) {
+      console.warn(TAG, '⚠️ 取未读总数失败:', e.message);
+      return -1;
+    }
+  }
+
+  // 翻页拉会话列表，收集 unread>0 的买家 uid（过滤 seller / ignoreUids）。
+  // 响应：result.contacts[] 每项 { uid, unread, ... }；page 递增翻页，contacts 短于 limit 即到底。
+  async function fetchUnreadConversations() {
+    const uids = [];
+    const seen = new Set();
+    const limit = CFG.contactListPageSize;
+    for (let page = 1; page <= CFG.contactListMaxPages; page++) {
+      const resp = await thorGet('/imcontact/contact.getPcList/1.0', {
+        limit, page, time: 0, getListType: 1, isNeedUnread: 1,
+        firstSellerUid: null, retry: false, sourceType: 1001,
+      });
+      if (resp?.status?.code !== 0) throw new Error('getPcList code=' + resp?.status?.code);
+      const contacts = resp?.result?.contacts || [];
+      for (const c of contacts) {
+        const uid = String(c.uid || '');
+        if (!uid || seen.has(uid)) continue;
+        seen.add(uid);
+        if (!(c.unread > 0)) continue;
+        if (uid === String(CFG.sellerUid)) continue;
+        if (CFG.ignoreUids.includes(uid)) continue;
+        uids.push(uid);
+      }
+      if (contacts.length < limit) break;  // 到底
+    }
+    return uids;
   }
 
   // ===========================================================================
@@ -822,6 +864,7 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
   }
 
   let sweepInProgress = false;    // 防止多次并发 sweep
+  let sweepDrivingHash = false;   // sweep 正在自驱 hash 切换 → hashchange 监听器跳过，避免重复触发 onConversationSwitch
   let switchHandlerBusy = false;  // 当前是否正在处理一个会话切换
   let switchBusySince = 0;        // busy 开始时间，用于超时保护
 
@@ -959,6 +1002,7 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
   // hashchange 监听
   function setupHashChangeListener() {
     pageWindow.addEventListener('hashchange', () => {
+      if (sweepDrivingHash) return;  // sweep 自驱切换时，由 sweep 自己 await onConversationSwitch，避免重复
       const match = location.hash.match(/#\/session\/recent\/(\d+)/);
       if (!match) return;
       const uid = match[1];
@@ -998,11 +1042,25 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
     return box;
   }
 
+  // 处理单个未读会话：切到目标会话让编辑器对齐，再走 onConversationSwitch。
+  // 由 sweep（API/DOM 两路）共用。白名单外只计 skip。
+  async function sweepProcessUid(uid, stats) {
+    if (CFG.testOnlyUids.length > 0 && !CFG.testOnlyUids.includes(uid)) {
+      console.log(TAG, '⏭️ sweep 白名单外:', uid);
+      stats.skipped++;
+      return;
+    }
+    if (getCurrentHashUid() !== uid) {
+      location.hash = '#/session/recent/' + uid;
+      await waitFor(() => getCurrentHashUid() === uid, 3000, 100);
+    }
+    await onConversationSwitch(uid);
+    stats.processed++;
+  }
+
   /**
-   * 「重头扫」遍历未读：每处理一条就回到列表最顶重开一轮，直到某一轮从顶滚到底都
-   * 找不到未读才收工。原因：处理一条会话会把它标记已读**并把它顶到列表最前**（重排），
-   * 单向往下扫会漏掉扫描位置上方新冒出的未读，故每轮 restart-from-top。
-   * seen 去重 + 轮数/滚动次数上限防死循环。
+   * 扫描未读会话并处理。优先走 thor API 直接列出未读（绕开虚拟列表/重排，0 未读秒退出）；
+   * API 失败则回退到 DOM「重头扫」。sweepDrivingHash 期间 hashchange 监听器跳过，避免重复触发。
    */
   async function sweep() {
     if (!CFG.autoreplyEnabled) {
@@ -1014,79 +1072,119 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
       return null;
     }
     sweepInProgress = true;
+    sweepDrivingHash = true;
     const stats = { total: 0, processed: 0, skipped: 0, errors: 0 };
-    const seen = new Set();
     try {
-      const scroller = getSidebarScroller();
-      console.log(TAG, '🧹 sweep 开始（重头扫未读）');
-
-      const MAX_ROUNDS = 100;
-      const MAX_SCROLL = 100;
-      let processedThisRound = true;
-      for (let round = 0; round < MAX_ROUNDS && processedThisRound; round++) {
-        processedThisRound = false;
-        // 每轮都回到最顶重新扫，确保上方新未读不被落下
-        if (scroller) {
-          scroller.scrollTop = 0;
-          await new Promise(r => setTimeout(r, 300));
+      // —— API 路：先看总未读，0 直接退出；再拉未读会话列表 ——
+      let uids = null;
+      try {
+        const total = await fetchUnreadCount();
+        if (total === 0) {
+          console.log(TAG, '✅ 无未读，sweep 早退出');
+          return stats;
         }
-
-        for (let s = 0; s < MAX_SCROLL; s++) {
-          const items = discoverUnreadItems();
-          if (items.length > 0) {
-            let handled = false;
-            try {
-              // 点最靠前的未读项，触发 hash 导航（也会把它标记已读，角标消失）
-              items[0].click();
-              await new Promise(r => setTimeout(r, 500));
-
-              const match = location.hash.match(/#\/session\/recent\/(\d+)/);
-              if (!match) {
-                console.warn(TAG, '⚠️ 点击后 hash 未变化');
-                stats.skipped++;
-              } else {
-                const uid = match[1];
-                if (!seen.has(uid)) {
-                  seen.add(uid);
-                  stats.total++;
-                  if (CFG.testOnlyUids.length > 0 && !CFG.testOnlyUids.includes(uid)) {
-                    console.log(TAG, '⏭️ sweep 白名单外:', uid);
-                    stats.skipped++;
-                  } else {
-                    await onConversationSwitch(uid);
-                    stats.processed++;
-                  }
-                  handled = true;
-                }
-                // uid 已在 seen（角标未即时清掉/重复）→ handled 保持 false，落到下面往下滚过它
-              }
-            } catch (e) {
-              console.error(TAG, '❌ sweep 单项失败:', e.message);
-              stats.errors++;
-            }
-            if (handled) {
-              // 真处理了一条 → 人性化间隔后回到外层重开一轮（从顶再扫）
-              await new Promise(r => setTimeout(r, CFG.sweepIntervalMs));
-              processedThisRound = true;
-              break;
-            }
-            // 未处理（seen / hash 没变）→ 不重开轮，往下滚过它
-          }
-
-          // 当前视口无新未读 → 向下滚一屏继续找；已到底则结束本轮
-          if (!scroller) break;
-          const atBottom = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 5;
-          if (atBottom) break;
-          scroller.scrollTop = Math.min(scroller.scrollTop + scroller.clientHeight, scroller.scrollHeight);
-          await new Promise(r => setTimeout(r, 400));
-        }
+        uids = await fetchUnreadConversations();
+      } catch (e) {
+        console.warn(TAG, '⚠️ API 取未读失败，回退 DOM 扫描:', e.message);
+        uids = null;
       }
 
+      if (uids === null) {
+        return await sweepViaDom(stats);  // API 失效兜底
+      }
+
+      stats.total = uids.length;
+      if (uids.length === 0) {
+        console.log(TAG, '✅ API 未读列表为空，sweep 结束');
+        return stats;
+      }
+      console.log(TAG, `🧹 sweep 开始（API 发现 ${uids.length} 个未读会话）`);
+      for (const uid of uids) {
+        try {
+          await sweepProcessUid(uid, stats);
+        } catch (e) {
+          console.error(TAG, '❌ sweep 单项失败:', e.message);
+          stats.errors++;
+        }
+        await new Promise(r => setTimeout(r, CFG.sweepIntervalMs));  // 人性化间隔
+      }
       console.log(TAG, `🧹 sweep 完成：处理 ${stats.processed}，跳过 ${stats.skipped}，失败 ${stats.errors}`);
       return stats;
     } finally {
+      sweepDrivingHash = false;
       sweepInProgress = false;
     }
+  }
+
+  /**
+   * DOM 回退：「重头扫」遍历未读 —— 每处理一条就回到列表最顶重开一轮，直到某一轮从顶滚到底
+   * 都找不到未读才收工。原因：处理一条会话会把它标记已读**并顶到列表最前**（重排），单向往下
+   * 扫会漏掉扫描位置上方新冒出的未读。seen 去重 + 轮数/滚动次数上限防死循环。
+   * 仅当 API 路不可用时调用（调用方已持有 sweepInProgress / sweepDrivingHash）。
+   */
+  async function sweepViaDom(stats) {
+    const seen = new Set();
+    const scroller = getSidebarScroller();
+    console.log(TAG, '🧹 sweep 开始（DOM 重头扫未读）');
+
+    const MAX_ROUNDS = 100;
+    const MAX_SCROLL = 100;
+    let processedThisRound = true;
+    for (let round = 0; round < MAX_ROUNDS && processedThisRound; round++) {
+      processedThisRound = false;
+      // 每轮都回到最顶重新扫，确保上方新未读不被落下
+      if (scroller) {
+        scroller.scrollTop = 0;
+        await new Promise(r => setTimeout(r, 300));
+      }
+
+      for (let s = 0; s < MAX_SCROLL; s++) {
+        const items = discoverUnreadItems();
+        if (items.length > 0) {
+          let handled = false;
+          try {
+            // 点最靠前的未读项，触发 hash 导航（也会把它标记已读，角标消失）
+            items[0].click();
+            await new Promise(r => setTimeout(r, 500));
+
+            const match = location.hash.match(/#\/session\/recent\/(\d+)/);
+            if (!match) {
+              console.warn(TAG, '⚠️ 点击后 hash 未变化');
+              stats.skipped++;
+            } else {
+              const uid = match[1];
+              if (!seen.has(uid)) {
+                seen.add(uid);
+                stats.total++;
+                await sweepProcessUid(uid, stats);
+                handled = true;
+              }
+              // uid 已在 seen（角标未即时清掉/重复）→ handled 保持 false，落到下面往下滚过它
+            }
+          } catch (e) {
+            console.error(TAG, '❌ sweep 单项失败:', e.message);
+            stats.errors++;
+          }
+          if (handled) {
+            // 真处理了一条 → 人性化间隔后回到外层重开一轮（从顶再扫）
+            await new Promise(r => setTimeout(r, CFG.sweepIntervalMs));
+            processedThisRound = true;
+            break;
+          }
+          // 未处理（seen / hash 没变）→ 不重开轮，往下滚过它
+        }
+
+        // 当前视口无新未读 → 向下滚一屏继续找；已到底则结束本轮
+        if (!scroller) break;
+        const atBottom = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 5;
+        if (atBottom) break;
+        scroller.scrollTop = Math.min(scroller.scrollTop + scroller.clientHeight, scroller.scrollHeight);
+        await new Promise(r => setTimeout(r, 400));
+      }
+    }
+
+    console.log(TAG, `🧹 sweep 完成（DOM）：处理 ${stats.processed}，跳过 ${stats.skipped}，失败 ${stats.errors}`);
+    return stats;
   }
 
   /**
