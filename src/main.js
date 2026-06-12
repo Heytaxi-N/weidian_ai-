@@ -192,6 +192,8 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
     deepseekUrl:     'https://api.deepseek.com/chat/completions',
     deepseekTemperature: 0.5,
     deepseekMaxTokens: 800,
+    deepseekMaxAttempts: 3,        // 含首次：空响应偶发，多试几次降频
+    deepseekRetryDelayMs: 500,     // 重试退避基数（第 n 次重试等 n*这个值）
 
     // 店铺
     sellerUid:  '7761657479685210349',
@@ -235,6 +237,12 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
     sweepOnLoad: lsGet('sweepOnLoad') !== 'false',   // 页面加载后自动扫描未读
     sweepDelayMs:    1500,  // hash 变化后等多久再拉历史
     sweepIntervalMs: 3000,  // 扫描时两个会话之间的间隔
+    periodicSweepMs: 120_000,  // 周期性扫描间隔（2 分钟，降低漏消息延迟）
+    wsStaleMs:       90_000,   // WS 超过这么久无消息视为可能断连 → 触发补扫
+
+    // 发送重试（瞬时类失败：切会话超时 / 编辑器未出现 / 未观察到 WS 帧）
+    sendMaxAttempts: 2,     // 含首次
+    sendRetryDelayMs: 800,
   };
 
   // ===========================================================================
@@ -251,7 +259,7 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
   // 消息去重：WS 实时路径和扫描路径共用，防止重复处理
   // ===========================================================================
   const processedMsgIds = new Set();
-  const PROCESSED_MAX = 500;
+  const PROCESSED_MAX = 2000;  // 高量长跑下太小会滚动失效导致罕见重处理
   function markProcessed(msgId) {
     if (!msgId) return;
     processedMsgIds.add(msgId);
@@ -401,27 +409,40 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
       throw new Error('DeepSeek API key 还没填，改 CFG.deepseekApiKey 或调 __wd.setKey(...)');
     }
 
-    // 第 1 次：用配置的温度
-    let attempt = await deepseekOnce(messages, CFG.deepseekTemperature);
-    if (attempt.parsed.ok) return attempt.parsed.value;
-
-    // 第 1 次失败 → 重试 1 次（temp=0，更确定的 JSON）
-    console.warn(TAG, '⚠️ 第 1 次 JSON 解析失败，重试 (temp=0)：', attempt.parsed.error, '原文长度:', attempt.raw.length);
-    try {
-      attempt = await deepseekOnce(messages, 0);
-    } catch (e) {
-      console.error(TAG, '❌ 重试请求失败：', e.message);
+    // 循环式重试：首次用配置温度，之后用 temp=0（更确定的 JSON），带退避。
+    // 空响应是 v4-flash 服务端毛刺，多试几次降频；全失败仍 escalate（红线：不凑合发）。
+    const maxAttempts = Math.max(1, CFG.deepseekMaxAttempts);
+    let attempt = null;
+    let lastError = '(未尝试)';
+    for (let i = 0; i < maxAttempts; i++) {
+      if (i > 0) {
+        await new Promise(r => setTimeout(r, CFG.deepseekRetryDelayMs * i));  // 退避
+      }
+      const temp = i === 0 ? CFG.deepseekTemperature : 0;
+      try {
+        attempt = await deepseekOnce(messages, temp);
+      } catch (e) {
+        // 请求本身抛异常（超时 / HTTP 错误）→ 记真实错误，不让上一轮残留掩盖
+        attempt = null;
+        lastError = e.message;
+        console.error(TAG, `❌ 第 ${i + 1} 次请求失败：`, e.message);
+        continue;
+      }
+      if (attempt.parsed.ok) {
+        if (i > 0) console.log(TAG, `✅ 重试成功（第 ${i + 1} 次）`);
+        return attempt.parsed.value;
+      }
+      lastError = attempt.parsed.error;
+      console.warn(TAG, `⚠️ 第 ${i + 1} 次 JSON 解析失败：`, attempt.parsed.error, '原文长度:', attempt.raw.length);
     }
-    if (attempt.parsed.ok) {
-      console.log(TAG, '✅ 重试成功');
-      return attempt.parsed.value;
-    }
 
-    // 重试也失败 → escalate
-    console.error(TAG, '❌ JSON 解析失败 (重试后) finish=', attempt.finishReason, '原文:', attempt.raw);
+    // 全部失败 → escalate（attempt 可能为 null，需兼容）
+    const finishReason = attempt?.finishReason;
+    const raw = attempt?.raw || '';
+    console.error(TAG, `❌ JSON 解析失败（${maxAttempts} 次后）finish=`, finishReason, '原文:', raw);
     return {
       should_escalate: true,
-      reason: `JSON 解析失败 (重试后, finish=${attempt.finishReason}): ${attempt.parsed.error} | 原文: ${attempt.raw.slice(0, 200)}`,
+      reason: `JSON 解析失败 (${maxAttempts} 次后, finish=${finishReason}): ${lastError} | 原文: ${raw.slice(0, 200)}`,
       draft: CFG.fallbackText,
     };
   }
@@ -565,68 +586,101 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
    * 编辑器里有非空草稿时直接放弃发送（避免覆盖人工输入），调用方应走 escalation。
    * 发送后通过 WS 出口帧验证；未观察到 send 帧 → 返 false（让调用方推草稿）。
    */
+  // 单次发送尝试。返回 { ok } 或 { ok:false, cause }，
+  // cause ∈ 'switch_timeout' | 'no_editor' | 'editor_busy' | 'no_frame'。
+  async function attemptSend(text, targetUid) {
+    // 1. hash 对齐：不匹配则切换（waitFor 在 Phase 4d 区块声明，函数提升后可用）
+    if (targetUid) {
+      const currentUid = getCurrentHashUid();
+      if (currentUid !== targetUid) {
+        console.log(TAG, '🔀 切换会话:', currentUid || '(none)', '→', targetUid);
+        location.hash = '#/session/recent/' + targetUid;
+        const hashOk = await waitFor(() => getCurrentHashUid() === targetUid, 3000, 100);
+        if (!hashOk) {
+          console.error(TAG, '❌ hash 切换超时，目标:', targetUid);
+          return { ok: false, cause: 'switch_timeout' };
+        }
+        const editorReady = await waitFor(findEditor, 3000, 100);
+        if (!editorReady) {
+          console.error(TAG, '❌ 切换后编辑器未出现:', targetUid);
+          return { ok: false, cause: 'no_editor' };
+        }
+        // React state / WS 订阅切到新会话需要 ~1.5s；之前 200ms 太短导致 Enter 静默失败
+        await new Promise(r => setTimeout(r, 1500));
+      }
+    }
+
+    // 2. 拿编辑器
+    const editor = findEditor();
+    if (!editor) {
+      console.error(TAG, '❌ 找不到输入框 (.textInput .editor)');
+      return { ok: false, cause: 'no_editor' };
+    }
+
+    // 3. 内容守卫：有任何内容都不覆盖（可能是卖家正在打字）
+    if (editor.textContent.trim().length > 0) {
+      console.warn(TAG, '⚠️ 编辑器有内容，放弃发送（避免覆盖人工输入）:', targetUid || '(unknown)');
+      return { ok: false, cause: 'editor_busy' };
+    }
+
+    // 4. 写入 + Enter，并捕获 Enter 前的最后一帧 outgoing 作为基线
+    const beforeOut = pageWindow.__wd_lastOutgoing;
+    editor.focus();
+    document.execCommand('selectAll', false);
+    document.execCommand('delete', false);
+    document.execCommand('insertText', false, text);
+    await new Promise(r => setTimeout(r, 50));
+    for (const evType of ['keydown', 'keypress', 'keyup']) {
+      editor.dispatchEvent(new KeyboardEvent(evType, {
+        key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
+      }));
+    }
+
+    // 5. 验证 WS 出口帧 —— 这是判断是否真的发出去的唯一可靠信号
+    const verifyTarget = targetUid || getCurrentHashUid();
+    if (!verifyTarget) {
+      console.warn(TAG, '⚠️ 无 targetUid 且 hash 无 uid，跳过验证');
+      return { ok: true };
+    }
+    const sentFrame = await verifyOutgoingSend(verifyTarget, beforeOut, 2000);
+    if (!sentFrame) {
+      console.error(TAG, '❌ Enter 后未观察到 send 帧（页面 state 未对齐？）→', verifyTarget, ':', text.slice(0, 60));
+      // 清掉 insertText 残留的草稿，否则编辑器单例会卡住后续对任何买家的发送（必中 editor_busy）。
+      // 真发出去的情况页面已清空，再清一次也无害。
+      const ed = findEditor();
+      if (ed && ed.textContent.trim().length > 0) {
+        ed.focus();
+        document.execCommand('selectAll', false);
+        document.execCommand('delete', false);
+      }
+      return { ok: false, cause: 'no_frame' };
+    }
+    console.log(TAG, '📤 已发送（已验证 WS 帧）→', verifyTarget, ':', text.slice(0, 60));
+    return { ok: true };
+  }
+
+  // 瞬时类失败可重试；editor_busy（人工在打字）不重试，直接交还调用方走 escalation。
+  const RETRYABLE_SEND_CAUSES = new Set(['switch_timeout', 'no_editor', 'no_frame']);
+
+  /**
+   * 发送回复给指定买家。返回 { ok:true } 或 { ok:false, cause }。
+   * targetUid 必填（防止串发）：会先把 hash 切到目标会话、等编辑器对齐再写入。
+   * 瞬时失败在锁内有限重试；仍失败时返回 cause 让调用方推草稿（红线：不凑合发）。
+   */
   async function sendReply(text, targetUid) {
     return withSendLock(async () => {
-      // 1. hash 对齐：不匹配则切换（waitFor 在 Phase 4d 区块声明，函数提升后可用）
-      if (targetUid) {
-        const currentUid = getCurrentHashUid();
-        if (currentUid !== targetUid) {
-          console.log(TAG, '🔀 切换会话:', currentUid || '(none)', '→', targetUid);
-          location.hash = '#/session/recent/' + targetUid;
-          const hashOk = await waitFor(() => getCurrentHashUid() === targetUid, 3000, 100);
-          if (!hashOk) {
-            console.error(TAG, '❌ hash 切换超时，目标:', targetUid);
-            return false;
-          }
-          const editorReady = await waitFor(findEditor, 3000, 100);
-          if (!editorReady) {
-            console.error(TAG, '❌ 切换后编辑器未出现:', targetUid);
-            return false;
-          }
-          // React state / WS 订阅切到新会话需要 ~1.5s；之前 200ms 太短导致 Enter 静默失败
-          await new Promise(r => setTimeout(r, 1500));
+      const maxAttempts = Math.max(1, CFG.sendMaxAttempts);
+      let result = { ok: false, cause: 'switch_timeout' };
+      for (let i = 0; i < maxAttempts; i++) {
+        if (i > 0) {
+          console.warn(TAG, `🔁 发送重试（第 ${i + 1} 次），上次 cause=${result.cause} →`, targetUid);
+          await new Promise(r => setTimeout(r, CFG.sendRetryDelayMs));
         }
+        result = await attemptSend(text, targetUid);
+        if (result.ok) return result;
+        if (!RETRYABLE_SEND_CAUSES.has(result.cause)) break;  // editor_busy 等不重试
       }
-
-      // 2. 拿编辑器
-      const editor = findEditor();
-      if (!editor) {
-        console.error(TAG, '❌ 找不到输入框 (.textInput .editor)');
-        return false;
-      }
-
-      // 3. 内容守卫：有任何内容都不覆盖（可能是卖家正在打字）
-      if (editor.textContent.trim().length > 0) {
-        console.warn(TAG, '⚠️ 编辑器有内容，放弃发送（避免覆盖人工输入）:', targetUid || '(unknown)');
-        return false;
-      }
-
-      // 4. 写入 + Enter，并捕获 Enter 前的最后一帧 outgoing 作为基线
-      const beforeOut = pageWindow.__wd_lastOutgoing;
-      editor.focus();
-      document.execCommand('selectAll', false);
-      document.execCommand('delete', false);
-      document.execCommand('insertText', false, text);
-      await new Promise(r => setTimeout(r, 50));
-      for (const evType of ['keydown', 'keypress', 'keyup']) {
-        editor.dispatchEvent(new KeyboardEvent(evType, {
-          key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true,
-        }));
-      }
-
-      // 5. 验证 WS 出口帧 —— 这是判断是否真的发出去的唯一可靠信号
-      const verifyTarget = targetUid || getCurrentHashUid();
-      if (!verifyTarget) {
-        console.warn(TAG, '⚠️ 无 targetUid 且 hash 无 uid，跳过验证');
-        return true;
-      }
-      const sentFrame = await verifyOutgoingSend(verifyTarget, beforeOut, 2000);
-      if (!sentFrame) {
-        console.error(TAG, '❌ Enter 后未观察到 send 帧（页面 state 未对齐？）→', verifyTarget, ':', text.slice(0, 60));
-        return false;
-      }
-      console.log(TAG, '📤 已发送（已验证 WS 帧）→', verifyTarget, ':', text.slice(0, 60));
-      return true;
+      return result;
     });
   }
 
@@ -689,15 +743,15 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
       const whitelisted = CFG.testOnlyUids.length === 0
         || CFG.testOnlyUids.includes(ev.buyerUid);
       if (whitelisted) {
-        const ok = await sendReply(aiResult.draft, ev.buyerUid);
-        if (ok) {
+        const sent = await sendReply(aiResult.draft, ev.buyerUid);
+        if (sent.ok) {
           addToHistory(ev.buyerUid, 'assistant', aiResult.draft);
         } else {
-          console.error(TAG, '❌ 发送失败 → 推草稿到企微:', aiResult.draft);
+          console.error(TAG, '❌ 发送失败 → 推草稿到企微:', sent.cause, aiResult.draft);
           await pushEscalation({
             buyerUid: ev.buyerUid, buyerName: ev.buyerName,
             draft: aiResult.draft,
-            reason: 'sendReply 失败（会话切换超时 / 编辑器有内容 / 找不到编辑器）',
+            reason: 'sendReply 失败: ' + sent.cause,
             currentText: text,
           });
         }
@@ -930,7 +984,25 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
   }
 
   /**
-   * 扫描所有未读会话并依次处理
+   * 找侧边栏的可滚动容器。微店侧边栏是虚拟列表，未读项可能在视口外没渲染，
+   * 必须滚动才能让 discoverUnreadItems 看到。优先 .sessions-list-box，
+   * 不可滚动则找它下面第一个可滚动子节点，回退到自身。
+   */
+  function getSidebarScroller() {
+    const box = document.querySelector('.sessions-list-box');
+    if (!box) return null;
+    if (box.scrollHeight > box.clientHeight + 5) return box;
+    for (const el of box.querySelectorAll('*')) {
+      if (el.scrollHeight > el.clientHeight + 5) return el;
+    }
+    return box;
+  }
+
+  /**
+   * 「重头扫」遍历未读：每处理一条就回到列表最顶重开一轮，直到某一轮从顶滚到底都
+   * 找不到未读才收工。原因：处理一条会话会把它标记已读**并把它顶到列表最前**（重排），
+   * 单向往下扫会漏掉扫描位置上方新冒出的未读，故每轮 restart-from-top。
+   * seen 去重 + 轮数/滚动次数上限防死循环。
    */
   async function sweep() {
     if (!CFG.autoreplyEnabled) {
@@ -943,45 +1015,74 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
     }
     sweepInProgress = true;
     const stats = { total: 0, processed: 0, skipped: 0, errors: 0 };
+    const seen = new Set();
     try {
-      const items = discoverUnreadItems();
-      stats.total = items.length;
-      console.log(TAG, `🧹 sweep 开始：发现 ${items.length} 个未读会话`);
+      const scroller = getSidebarScroller();
+      console.log(TAG, '🧹 sweep 开始（重头扫未读）');
 
-      for (const item of items) {
-        try {
-          // 点击会话项，触发 hash 导航
-          item.click();
-          // 等待 hash 变化
-          await new Promise(r => setTimeout(r, 500));
-
-          const match = location.hash.match(/#\/session\/recent\/(\d+)/);
-          if (!match) {
-            console.warn(TAG, '⚠️ 点击后 hash 未变化');
-            stats.skipped++;
-            continue;
-          }
-          const uid = match[1];
-
-          // 白名单检查
-          if (CFG.testOnlyUids.length > 0 && !CFG.testOnlyUids.includes(uid)) {
-            console.log(TAG, '⏭️ sweep 白名单外:', uid);
-            stats.skipped++;
-            await new Promise(r => setTimeout(r, 500));
-            continue;
-          }
-
-          await onConversationSwitch(uid);
-          stats.processed++;
-        } catch (e) {
-          console.error(TAG, '❌ sweep 单项失败:', e.message);
-          stats.errors++;
+      const MAX_ROUNDS = 100;
+      const MAX_SCROLL = 100;
+      let processedThisRound = true;
+      for (let round = 0; round < MAX_ROUNDS && processedThisRound; round++) {
+        processedThisRound = false;
+        // 每轮都回到最顶重新扫，确保上方新未读不被落下
+        if (scroller) {
+          scroller.scrollTop = 0;
+          await new Promise(r => setTimeout(r, 300));
         }
-        // 人性化间隔
-        await new Promise(r => setTimeout(r, CFG.sweepIntervalMs));
+
+        for (let s = 0; s < MAX_SCROLL; s++) {
+          const items = discoverUnreadItems();
+          if (items.length > 0) {
+            let handled = false;
+            try {
+              // 点最靠前的未读项，触发 hash 导航（也会把它标记已读，角标消失）
+              items[0].click();
+              await new Promise(r => setTimeout(r, 500));
+
+              const match = location.hash.match(/#\/session\/recent\/(\d+)/);
+              if (!match) {
+                console.warn(TAG, '⚠️ 点击后 hash 未变化');
+                stats.skipped++;
+              } else {
+                const uid = match[1];
+                if (!seen.has(uid)) {
+                  seen.add(uid);
+                  stats.total++;
+                  if (CFG.testOnlyUids.length > 0 && !CFG.testOnlyUids.includes(uid)) {
+                    console.log(TAG, '⏭️ sweep 白名单外:', uid);
+                    stats.skipped++;
+                  } else {
+                    await onConversationSwitch(uid);
+                    stats.processed++;
+                  }
+                  handled = true;
+                }
+                // uid 已在 seen（角标未即时清掉/重复）→ handled 保持 false，落到下面往下滚过它
+              }
+            } catch (e) {
+              console.error(TAG, '❌ sweep 单项失败:', e.message);
+              stats.errors++;
+            }
+            if (handled) {
+              // 真处理了一条 → 人性化间隔后回到外层重开一轮（从顶再扫）
+              await new Promise(r => setTimeout(r, CFG.sweepIntervalMs));
+              processedThisRound = true;
+              break;
+            }
+            // 未处理（seen / hash 没变）→ 不重开轮，往下滚过它
+          }
+
+          // 当前视口无新未读 → 向下滚一屏继续找；已到底则结束本轮
+          if (!scroller) break;
+          const atBottom = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 5;
+          if (atBottom) break;
+          scroller.scrollTop = Math.min(scroller.scrollTop + scroller.clientHeight, scroller.scrollHeight);
+          await new Promise(r => setTimeout(r, 400));
+        }
       }
 
-      console.log(TAG, `🧹 sweep 完成：${stats.total} 个未读，处理 ${stats.processed}，跳过 ${stats.skipped}，失败 ${stats.errors}`);
+      console.log(TAG, `🧹 sweep 完成：处理 ${stats.processed}，跳过 ${stats.skipped}，失败 ${stats.errors}`);
       return stats;
     } finally {
       sweepInProgress = false;
@@ -999,6 +1100,7 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
       if (lastTs < cutoff) {
         conversations.delete(uid);
         buyerLocks.delete(uid);
+        escalationDebouncer.reset(uid);  // 否则 debouncer 内部 Map 永不清理，长跑泄漏
         cleaned++;
       }
     }
@@ -1029,11 +1131,11 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
       await sweep().catch(e => console.error(TAG, '首次扫描失败:', e));
     }
 
-    // 之后每 5 分钟
+    // 之后每 periodicSweepMs（默认 2 分钟）
     setInterval(() => {
-      // WS 心跳检测
-      if (Date.now() - lastWsMessageAt > 5 * 60 * 1000) {
-        console.warn(TAG, '⚠️ 超过 5 分钟未收到 WS 消息，可能断连');
+      // WS 心跳检测：超过 wsStaleMs 没消息视为可能断连，除告警外靠本轮 sweep 兜底
+      if (Date.now() - lastWsMessageAt > CFG.wsStaleMs) {
+        console.warn(TAG, `⚠️ 超过 ${Math.round(CFG.wsStaleMs / 1000)}s 未收到 WS 消息，可能断连 → 补扫`);
       }
       // 清理过期 Map
       cleanupMaps();
@@ -1042,7 +1144,17 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
         console.log(TAG, '🔄 周期性扫描...');
         sweep().catch(e => console.error(TAG, '周期扫描失败:', e));
       }
-    }, 5 * 60 * 1000);
+    }, CFG.periodicSweepMs);
+  }
+
+  // WS 断连后调度一次补扫（页面通常会自动重连，等几秒让它先重连）
+  function scheduleReconnectSweep() {
+    if (!CFG.autoreplyEnabled || !CFG.sweepOnLoad) return;
+    setTimeout(() => {
+      if (sweepInProgress) return;
+      console.log(TAG, '🔄 WS 断连后补扫...');
+      sweep().catch(e => console.error(TAG, '断连补扫失败:', e));
+    }, 5000);
   }
 
   // ===========================================================================
@@ -1064,7 +1176,14 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
       // fire-and-forget；handleIncoming 内部已 try/catch
       handleIncoming(parsed).catch(e => console.error(TAG, e));
     });
-    ws.addEventListener('close', (ev) => console.warn(`${TAG} WS[${id}] CLOSE`, ev.code));
+    ws.addEventListener('close', (ev) => {
+      console.warn(`${TAG} WS[${id}] CLOSE`, ev.code);
+      // 从 sockets 数组剪掉，避免长跑下重连累积泄漏（id 已在闭包捕获，日志不受影响）
+      const idx = sockets.indexOf(ws);
+      if (idx >= 0) sockets.splice(idx, 1);
+      // 断连后补扫，捞回断连窗口期可能漏收的消息
+      scheduleReconnectSweep();
+    });
     ws.addEventListener('error', (ev) => console.error(`${TAG} WS[${id}] ERROR`, ev));
 
     const origSend = ws.send.bind(ws);
@@ -1101,9 +1220,9 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
       return CFG.autoreplyEnabled;
     },
     send: async (text, targetUid) => {
-      const ok = await sendReply(text, targetUid);
-      console.log(TAG, ok ? '✅ 手动发送成功' : '❌ 手动发送失败');
-      return ok;
+      const r = await sendReply(text, targetUid);
+      console.log(TAG, r.ok ? '✅ 手动发送成功' : '❌ 手动发送失败: ' + r.cause);
+      return r;
     },
     debug: (on = true) => {
       pageWindow.__wd_debug = on;
