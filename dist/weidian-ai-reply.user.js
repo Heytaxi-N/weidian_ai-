@@ -632,10 +632,25 @@ const __KB_FAQ__    = "# 高频可自动回复话术\n\n以下内容或类似语
     }
   }
 
-  // 翻页拉会话列表，收集 unread>0 的买家 uid（过滤 seller / ignoreUids）。
+  // 清掉指定会话的未读（标记已读，不发任何消息）。best-effort：失败只 warn。
+  // 用于供货商（ignoreUids）——bot 不回复但帮你把红点抹掉。系统消息不在买家列表里，不受影响。
+  async function clearUnread(uid) {
+    try {
+      const resp = await thorGet('/immessage/unread.clearUnread/1.0', { targetUid: uid, fromSourceType: 1001 });
+      const ok = resp?.status?.code === 0;
+      if (!ok) console.warn(TAG, '⚠️ clearUnread 非成功 code:', resp?.status?.code, uid);
+      return ok;
+    } catch (e) {
+      console.warn(TAG, '⚠️ clearUnread 失败:', e.message, uid);
+      return false;
+    }
+  }
+
+  // 翻页拉会话列表，分出 unread>0 的买家 uid（待处理）和供货商 uid（待静默清未读）。
   // 响应：result.contacts[] 每项 { uid, unread, ... }；page 递增翻页，contacts 短于 limit 即到底。
   async function fetchUnreadConversations() {
-    const uids = [];
+    const buyers = [];
+    const suppliersToClear = [];
     const seen = new Set();
     const limit = CFG.contactListPageSize;
     for (let page = 1; page <= CFG.contactListMaxPages; page++) {
@@ -650,13 +665,13 @@ const __KB_FAQ__    = "# 高频可自动回复话术\n\n以下内容或类似语
         if (!uid || seen.has(uid)) continue;
         seen.add(uid);
         if (!(c.unread > 0)) continue;
-        if (uid === String(CFG.sellerUid)) continue;
-        if (CFG.ignoreUids.includes(uid)) continue;
-        uids.push(uid);
+        if (uid === String(CFG.sellerUid)) continue;       // 卖家自己，直接跳过
+        if (CFG.ignoreUids.includes(uid)) { suppliersToClear.push(uid); continue; }  // 供货商：静默清未读
+        buyers.push(uid);
       }
       if (contacts.length < limit) break;  // 到底
     }
-    return uids;
+    return { buyers, suppliersToClear };
   }
 
   // ===========================================================================
@@ -1162,30 +1177,40 @@ const __KB_FAQ__    = "# 高频可自动回复话术\n\n以下内容或类似语
     const stats = { total: 0, processed: 0, skipped: 0, errors: 0 };
     try {
       // —— API 路：先看总未读，0 直接退出；再拉未读会话列表 ——
-      let uids = null;
+      let lists = null;
       try {
         const total = await fetchUnreadCount();
         if (total === 0) {
           console.log(TAG, '✅ 无未读，sweep 早退出');
           return stats;
         }
-        uids = await fetchUnreadConversations();
+        lists = await fetchUnreadConversations();
       } catch (e) {
         console.warn(TAG, '⚠️ API 取未读失败，回退 DOM 扫描:', e.message);
-        uids = null;
+        lists = null;
       }
 
-      if (uids === null) {
+      if (lists === null) {
         return await sweepViaDom(stats);  // API 失效兜底
       }
 
-      stats.total = uids.length;
-      if (uids.length === 0) {
-        console.log(TAG, '✅ API 未读列表为空，sweep 结束');
+      const { buyers, suppliersToClear } = lists;
+
+      // 供货商：静默清未读（不切会话、不回复），帮你抹掉红点
+      for (const uid of suppliersToClear) {
+        await clearUnread(uid);
+      }
+      if (suppliersToClear.length > 0) {
+        console.log(TAG, `🧹 已静默清掉 ${suppliersToClear.length} 个供货商未读`);
+      }
+
+      stats.total = buyers.length;
+      if (buyers.length === 0) {
+        console.log(TAG, '✅ 无买家未读，sweep 结束');
         return stats;
       }
-      console.log(TAG, `🧹 sweep 开始（API 发现 ${uids.length} 个未读会话）`);
-      for (const uid of uids) {
+      console.log(TAG, `🧹 sweep 开始（API 发现 ${buyers.length} 个买家未读会话）`);
+      for (const uid of buyers) {
         try {
           await sweepProcessUid(uid, stats);
         } catch (e) {
