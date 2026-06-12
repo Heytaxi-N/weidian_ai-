@@ -170,18 +170,42 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
   // Pure, side-effect-free functions. Tested by tests/*.test.mjs.
 // Built into dist/ by scripts/build.mjs (which strips the `export ` keywords).
 
+/**
+ * 从原始响应里抠出 JSON 对象。处理三种情况：
+ * 1. 纯 JSON                   → 原样返回
+ * 2. ```json...``` 代码块包裹  → 剥掉围栏
+ * 3. JSON 前后有废话           → 用最外层 {...} regex 提取
+ * 空字符串 / 找不到 {} → 返回空字符串（上层会判定为 parse 失败）
+ */
+function extractJSON(raw) {
+  if (typeof raw !== 'string') return '';
+  let s = raw.trim();
+  if (!s) return '';
+  // 剥代码块围栏
+  s = s.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+  // 已经是 JSON 对象就直接返回
+  if (s.startsWith('{') && s.endsWith('}')) return s;
+  // 否则用 regex 找最外层大括号
+  const m = s.match(/\{[\s\S]*\}/);
+  return m ? m[0] : '';
+}
+
 function parseAIOutput(raw) {
+  const cleaned = extractJSON(raw);
+  if (!cleaned) {
+    return { ok: false, error: 'empty or no JSON object found' };
+  }
   let obj;
   try {
-    obj = JSON.parse(raw);
+    obj = JSON.parse(cleaned);
   } catch (e) {
     return { ok: false, error: 'JSON parse failed: ' + e.message };
   }
   if (typeof obj.should_escalate !== 'boolean') {
     return { ok: false, error: 'should_escalate missing or wrong type' };
   }
-  if (typeof obj.draft !== 'string') {
-    return { ok: false, error: 'draft missing or wrong type' };
+  if (typeof obj.draft !== 'string' || obj.draft.trim() === '') {
+    return { ok: false, error: 'draft missing or empty' };
   }
   const reason = typeof obj.reason === 'string' ? obj.reason : '';
   return { ok: true, value: { should_escalate: obj.should_escalate, reason, draft: obj.draft } };
@@ -423,10 +447,7 @@ const __KB_FAQ__    = "# 高频可自动回复话术\n\n以下内容或类似语
     return messages;
   }
 
-  async function callDeepSeek(messages) {
-    if (!CFG.deepseekApiKey || CFG.deepseekApiKey.includes('PLACEHOLDER')) {
-      throw new Error('DeepSeek API key 还没填，改 CFG.deepseekApiKey 或调 __wd.setKey(...)');
-    }
+  async function deepseekOnce(messages, temperature) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 30000);
     let res;
@@ -437,7 +458,7 @@ const __KB_FAQ__    = "# 高频可自动回复话术\n\n以下内容或类似语
         body: JSON.stringify({
           model: CFG.deepseekModel,
           messages,
-          temperature: CFG.deepseekTemperature,
+          temperature,
           max_tokens: CFG.deepseekMaxTokens,
           stream: false,
           response_format: { type: 'json_object' },
@@ -455,19 +476,40 @@ const __KB_FAQ__    = "# 高频可自动回复话术\n\n以下内容或类似语
       throw new Error(`DeepSeek HTTP ${res.status}: ${body.slice(0, 200)}`);
     }
     const json = await res.json();
-    const raw = (json.choices?.[0]?.message?.content || '').trim();
+    const raw = json.choices?.[0]?.message?.content || '';
     const finishReason = json.choices?.[0]?.finish_reason;
     const parsed = parseAIOutput(raw);
-    if (!parsed.ok) {
-      // 安全默认：JSON 失败视为 escalate；附 finish_reason 帮助定位（length=被 max_tokens 截断）
-      console.error(TAG, '❌ JSON 解析失败 finish=', finishReason, '原文:', raw);
-      return {
-        should_escalate: true,
-        reason: `JSON 解析失败 (finish=${finishReason}): ${parsed.error} | 原文: ${raw.slice(0, 200)}`,
-        draft: CFG.fallbackText,
-      };
+    return { parsed, raw, finishReason };
+  }
+
+  async function callDeepSeek(messages) {
+    if (!CFG.deepseekApiKey || CFG.deepseekApiKey.includes('PLACEHOLDER')) {
+      throw new Error('DeepSeek API key 还没填，改 CFG.deepseekApiKey 或调 __wd.setKey(...)');
     }
-    return parsed.value;
+
+    // 第 1 次：用配置的温度
+    let attempt = await deepseekOnce(messages, CFG.deepseekTemperature);
+    if (attempt.parsed.ok) return attempt.parsed.value;
+
+    // 第 1 次失败 → 重试 1 次（temp=0，更确定的 JSON）
+    console.warn(TAG, '⚠️ 第 1 次 JSON 解析失败，重试 (temp=0)：', attempt.parsed.error, '原文长度:', attempt.raw.length);
+    try {
+      attempt = await deepseekOnce(messages, 0);
+    } catch (e) {
+      console.error(TAG, '❌ 重试请求失败：', e.message);
+    }
+    if (attempt.parsed.ok) {
+      console.log(TAG, '✅ 重试成功');
+      return attempt.parsed.value;
+    }
+
+    // 重试也失败 → escalate
+    console.error(TAG, '❌ JSON 解析失败 (重试后) finish=', attempt.finishReason, '原文:', attempt.raw);
+    return {
+      should_escalate: true,
+      reason: `JSON 解析失败 (重试后, finish=${attempt.finishReason}): ${attempt.parsed.error} | 原文: ${attempt.raw.slice(0, 200)}`,
+      draft: CFG.fallbackText,
+    };
   }
 
   // ===========================================================================

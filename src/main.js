@@ -361,10 +361,7 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
     return messages;
   }
 
-  async function callDeepSeek(messages) {
-    if (!CFG.deepseekApiKey || CFG.deepseekApiKey.includes('PLACEHOLDER')) {
-      throw new Error('DeepSeek API key 还没填，改 CFG.deepseekApiKey 或调 __wd.setKey(...)');
-    }
+  async function deepseekOnce(messages, temperature) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 30000);
     let res;
@@ -375,7 +372,7 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
         body: JSON.stringify({
           model: CFG.deepseekModel,
           messages,
-          temperature: CFG.deepseekTemperature,
+          temperature,
           max_tokens: CFG.deepseekMaxTokens,
           stream: false,
           response_format: { type: 'json_object' },
@@ -393,19 +390,40 @@ TEST_BUYER_JASON_UID = "8231960975030111227"
       throw new Error(`DeepSeek HTTP ${res.status}: ${body.slice(0, 200)}`);
     }
     const json = await res.json();
-    const raw = (json.choices?.[0]?.message?.content || '').trim();
+    const raw = json.choices?.[0]?.message?.content || '';
     const finishReason = json.choices?.[0]?.finish_reason;
     const parsed = parseAIOutput(raw);
-    if (!parsed.ok) {
-      // 安全默认：JSON 失败视为 escalate；附 finish_reason 帮助定位（length=被 max_tokens 截断）
-      console.error(TAG, '❌ JSON 解析失败 finish=', finishReason, '原文:', raw);
-      return {
-        should_escalate: true,
-        reason: `JSON 解析失败 (finish=${finishReason}): ${parsed.error} | 原文: ${raw.slice(0, 200)}`,
-        draft: CFG.fallbackText,
-      };
+    return { parsed, raw, finishReason };
+  }
+
+  async function callDeepSeek(messages) {
+    if (!CFG.deepseekApiKey || CFG.deepseekApiKey.includes('PLACEHOLDER')) {
+      throw new Error('DeepSeek API key 还没填，改 CFG.deepseekApiKey 或调 __wd.setKey(...)');
     }
-    return parsed.value;
+
+    // 第 1 次：用配置的温度
+    let attempt = await deepseekOnce(messages, CFG.deepseekTemperature);
+    if (attempt.parsed.ok) return attempt.parsed.value;
+
+    // 第 1 次失败 → 重试 1 次（temp=0，更确定的 JSON）
+    console.warn(TAG, '⚠️ 第 1 次 JSON 解析失败，重试 (temp=0)：', attempt.parsed.error, '原文长度:', attempt.raw.length);
+    try {
+      attempt = await deepseekOnce(messages, 0);
+    } catch (e) {
+      console.error(TAG, '❌ 重试请求失败：', e.message);
+    }
+    if (attempt.parsed.ok) {
+      console.log(TAG, '✅ 重试成功');
+      return attempt.parsed.value;
+    }
+
+    // 重试也失败 → escalate
+    console.error(TAG, '❌ JSON 解析失败 (重试后) finish=', attempt.finishReason, '原文:', attempt.raw);
+    return {
+      should_escalate: true,
+      reason: `JSON 解析失败 (重试后, finish=${attempt.finishReason}): ${attempt.parsed.error} | 原文: ${attempt.raw.slice(0, 200)}`,
+      draft: CFG.fallbackText,
+    };
   }
 
   // ===========================================================================
